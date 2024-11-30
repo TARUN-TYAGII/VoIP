@@ -1,16 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 
-// Persistent Client ID Generation
 const generateClientId = () => {
     let clientId = localStorage.getItem('voip-client-id');
     if (!clientId) {
-        clientId = Math.random().toString(36).substr(2, 9);
+        clientId = Math.floor(1000 + Math.random() * 9000).toString();
         localStorage.setItem('voip-client-id', clientId);
     }
     return clientId;
 };
 
-// Utility function to serialize ICE candidate
 const serializeIceCandidate = (candidate) => {
     if (!candidate) return null;
     return {
@@ -21,12 +19,10 @@ const serializeIceCandidate = (candidate) => {
     };
 };
 
-// WebSocket Signaling Hook
 const useWebSocket = (url) => {
     const [socket, setSocket] = useState(null);
     const [isConnected, setIsConnected] = useState(false);
     const [clientId] = useState(generateClientId());
-    const broadcastChannel = useRef(new BroadcastChannel('voip-signaling'));
 
     const createWebSocket = useCallback(() => {
         const ws = new WebSocket(url);
@@ -45,7 +41,6 @@ const useWebSocket = (url) => {
             console.log('WebSocket Disconnected');
             setIsConnected(false);
             setSocket(null);
-            // Attempt reconnection
             setTimeout(createWebSocket, 3000);
         };
 
@@ -69,9 +64,6 @@ const useWebSocket = (url) => {
                 from: clientId
             };
             socket.send(JSON.stringify(fullMessage));
-            
-            // Broadcast to other tabs
-            broadcastChannel.current.postMessage(fullMessage);
         }
     }, [socket, clientId]);
 
@@ -79,12 +71,10 @@ const useWebSocket = (url) => {
         socket, 
         isConnected, 
         sendMessage, 
-        clientId,
-        broadcastChannel: broadcastChannel.current 
+        clientId 
     };
 };
 
-// WebRTC Connection Hook
 const useWebRTC = (signaling) => {
     const [localStream, setLocalStream] = useState(null);
     const [remoteStream, setRemoteStream] = useState(null);
@@ -94,7 +84,13 @@ const useWebRTC = (signaling) => {
     const configuration = {
         iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' }
+            { urls: 'stun:stun1.l.google.com:19302' },
+            // Consider adding TURN servers for better NAT traversal
+            {
+                urls: 'turn:openrelay.metered.ca:80',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            }
         ]
     };
 
@@ -108,21 +104,23 @@ const useWebRTC = (signaling) => {
 
         pc.onicecandidate = (event) => {
             if (event.candidate) {
-                // Serialize the ICE candidate before sending
+                console.log('Sending ICE candidate:', event.candidate);
                 signaling.sendMessage({
                     type: 'ice-candidate',
                     candidate: serializeIceCandidate(event.candidate),
-                    target: targetClientId
+                    target: targetClientId,
                 });
             }
         };
 
         pc.ontrack = (event) => {
+            console.log('Remote stream received:', event.streams[0]);
             setRemoteStream(event.streams[0]);
             setConnectionState('connected');
         };
-
+        
         pc.onconnectionstatechange = () => {
+            console.log('Connection state:', pc.connectionState);
             setConnectionState(pc.connectionState);
         };
 
@@ -133,7 +131,10 @@ const useWebRTC = (signaling) => {
     const getLocalMedia = useCallback(async () => {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
-                video: true,
+                video: { 
+                    width: { ideal: 640 },
+                    height: { ideal: 480 }
+                },
                 audio: true
             });
             setLocalStream(stream);
@@ -147,14 +148,18 @@ const useWebRTC = (signaling) => {
     const createOffer = useCallback(async (targetClientId) => {
         const pc = createPeerConnection(targetClientId);
 
-        // Add local tracks
         if (localStream) {
-            localStream.getTracks().forEach(track => {
+            localStream.getTracks().forEach((track) => {
                 pc.addTrack(track, localStream);
             });
+        } else {
+            console.error('No local stream available.');
         }
 
-        const offer = await pc.createOffer();
+        const offer = await pc.createOffer({
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: true
+        });
         await pc.setLocalDescription(offer);
         
         return offer;
@@ -163,11 +168,12 @@ const useWebRTC = (signaling) => {
     const handleOffer = useCallback(async (offer, fromClientId) => {
         const pc = createPeerConnection(fromClientId);
 
-        // Add local tracks
         if (localStream) {
-            localStream.getTracks().forEach(track => {
+            localStream.getTracks().forEach((track) => {
                 pc.addTrack(track, localStream);
             });
+        } else {
+            console.error('No local stream available.');
         }
 
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -180,7 +186,6 @@ const useWebRTC = (signaling) => {
     const addIceCandidate = useCallback(async (candidateData) => {
         if (peerConnectionRef.current && candidateData) {
             try {
-                // Convert serialized candidate back to RTCIceCandidate
                 const candidate = new RTCIceCandidate(candidateData);
                 await peerConnectionRef.current.addIceCandidate(candidate);
             } catch (error) {
@@ -201,9 +206,8 @@ const useWebRTC = (signaling) => {
     };
 };
 
-// Main VoIP Application Component
 const VoIPApp = () => {
-    const { socket, isConnected, sendMessage, clientId, broadcastChannel } = useWebSocket('ws://voip-cpjv.onrender.com');
+    const { socket, isConnected, sendMessage, clientId } = useWebSocket('wss://voip-cpjv.onrender.com');
     const {
         localStream,
         remoteStream,
@@ -219,11 +223,11 @@ const VoIPApp = () => {
     const [mediaReady, setMediaReady] = useState(false);
     const [targetClientId, setTargetClientId] = useState(null);
 
-    // Cross-tab communication setup
+    // WebSocket message handling
     useEffect(() => {
-        const handleBroadcastMessage = async (event) => {
+        const handleWebSocketMessage = async (event) => {
             try {
-                const message = event.data;
+                const message = JSON.parse(event.data);
 
                 // Ignore messages not meant for this client
                 if (message.target && message.target !== clientId) return;
@@ -256,33 +260,20 @@ const VoIPApp = () => {
                         break;
                 }
             } catch (error) {
-                console.error('Error handling broadcast message:', error);
+                console.error('Error handling WebSocket message:', error);
                 setCallState('idle');
             }
         };
 
-        // Direct WebSocket message handler
-        const handleWebSocketMessage = async (event) => {
-            try {
-                const message = JSON.parse(event.data);
-                handleBroadcastMessage({ data: message });
-            } catch (error) {
-                console.error('Error parsing WebSocket message:', error);
-            }
-        };
-
-        // Add listeners
-        broadcastChannel.addEventListener('message', handleBroadcastMessage);
+        // Add listener
         socket?.addEventListener('message', handleWebSocketMessage);
 
         // Cleanup
         return () => {
-            broadcastChannel.removeEventListener('message', handleBroadcastMessage);
             socket?.removeEventListener('message', handleWebSocketMessage);
         };
     }, [
         socket, 
-        broadcastChannel, 
         sendMessage, 
         handleOffer, 
         addIceCandidate, 
@@ -321,155 +312,154 @@ const VoIPApp = () => {
         }
     };
 
-    // Determine if call button should be disabled
     const isCallButtonDisabled = 
-        !isConnected ||  // Not connected to WebSocket
-        !mediaReady ||   // Local media not initialized
-        callState !== 'idle' ||  // Not in idle state
-        !targetClientId;  // No target client selected
+        !isConnected ||
+        !mediaReady ||
+        callState !== 'idle' ||
+        !targetClientId;
 
-        return (
-            <div className="voip-container">
-                <div className="connection-info">
-                    <div>My Client ID: {clientId}</div>
-                    <div>Connection Status: {isConnected ? 'Connected' : 'Disconnected'}</div>
-                    <div>Call State: {callState}</div>
-                    <div>Connection State: {connectionState}</div>
-                    <div>Media Ready: {mediaReady ? 'Yes' : 'No'}</div>
-                </div>
-        
-                <div className="video-container" style={{
-                    display: 'flex', 
-                    justifyContent: 'space-between', 
-                    gap: '10px'
-                }}>
+    return (
+        <div className="voip-container">
+            <div className="connection-info">
+                <div>My Client ID: {clientId}</div>
+                <div>Connection Status: {isConnected ? 'Connected' : 'Disconnected'}</div>
+                <div>Call State: {callState}</div>
+                <div>Connection State: {connectionState}</div>
+                <div>Media Ready: {mediaReady ? 'Yes' : 'No'}</div>
+            </div>
+    
+            <div className="video-container" style={{
+                display: 'flex', 
+                justifyContent: 'space-between', 
+                gap: '10px'
+            }}>
+                <div 
+                    className="local-video" 
+                    style={{
+                        position: 'relative',
+                        border: '2px solid green',
+                        padding: '10px',
+                        width: '48%',
+                        textAlign: 'center'
+                    }}
+                >
                     <div 
-                        className="local-video" 
                         style={{
-                            position: 'relative',
-                            border: '2px solid green',
-                            padding: '10px',
-                            width: '48%',
-                            textAlign: 'center'
+                            position: 'absolute', 
+                            top: '10px', 
+                            left: '10px', 
+                            backgroundColor: 'rgba(0,0,0,0.5)', 
+                            color: 'white', 
+                            padding: '5px',
+                            borderRadius: '5px'
                         }}
                     >
-                        <div 
-                            style={{
-                                position: 'absolute', 
-                                top: '10px', 
-                                left: '10px', 
-                                backgroundColor: 'rgba(0,0,0,0.5)', 
-                                color: 'white', 
-                                padding: '5px',
-                                borderRadius: '5px'
-                            }}
-                        >
-                            Local Stream
-                        </div>
-                        <video
-                            ref={(video) => {
-                                if (video) video.srcObject = localStream;
-                            }}
-                            autoPlay
-                            muted
-                            playsInline
-                            style={{
-                                width: '100%',
-                                maxHeight: '300px',
-                                objectFit: 'cover',
-                                transform: 'scaleX(-1)' // Mirror local video
-                            }}
-                        />
-                        {!localStream && (
-                            <div style={{
-                                position: 'absolute',
-                                top: '50%',
-                                left: '50%',
-                                transform: 'translate(-50%, -50%)',
-                                color: 'red'
-                            }}>
-                                No Local Stream
-                            </div>
-                        )}
+                        Local Stream
                     </div>
-        
-                    <div 
-                        className="remote-video" 
-                        style={{
-                            position: 'relative',
-                            border: '2px solid blue',
-                            padding: '10px',
-                            width: '48%',
-                            textAlign: 'center'
+                    <video
+                        ref={(video) => {
+                            if (video) video.srcObject = localStream;
                         }}
-                    >
-                        <div 
-                            style={{
-                                position: 'absolute', 
-                                top: '10px', 
-                                left: '10px', 
-                                backgroundColor: 'rgba(0,0,0,0.5)', 
-                                color: 'white', 
-                                padding: '5px',
-                                borderRadius: '5px'
-                            }}
-                        >
-                            Remote Stream
-                        </div>
-                        <video
-                            ref={(video) => {
-                                if (video) video.srcObject = remoteStream;
-                            }}
-                            autoPlay
-                            playsInline
-                            style={{
-                                width: '100%',
-                                maxHeight: '300px',
-                                objectFit: 'cover'
-                            }}
-                        />
-                        {!remoteStream && (
-                            <div style={{
-                                position: 'absolute',
-                                top: '50%',
-                                left: '50%',
-                                transform: 'translate(-50%, -50%)',
-                                color: 'red'
-                            }}>
-                                Waiting for Remote Stream
-                            </div>
-                        )}
-                    </div>
-                </div>
-        
-                <div className="controls">
-                    <input 
-                        type="text" 
-                        placeholder="Enter target Client ID"
-                        value={targetClientId || ''}
-                        onChange={(e) => setTargetClientId(e.target.value)}
+                        autoPlay
+                        muted
+                        playsInline
                         style={{
-                            padding: '10px',
-                            width: '200px',
-                            marginRight: '10px'
+                            width: '100%',
+                            maxHeight: '300px',
+                            objectFit: 'cover',
+                            transform: 'scaleX(-1)' // Mirror local video
                         }}
                     />
-                    <button 
-                        onClick={initiateCall}
-                        disabled={isCallButtonDisabled}
+                    {!localStream && (
+                        <div style={{
+                            position: 'absolute',
+                            top: '50%',
+                            left: '50%',
+                            transform: 'translate(-50%, -50%)',
+                            color: 'red'
+                        }}>
+                            No Local Stream
+                        </div>
+                    )}
+                </div>
+    
+                <div 
+                    className="remote-video" 
+                    style={{
+                        position: 'relative',
+                        border: '2px solid blue',
+                        padding: '10px',
+                        width: '48%',
+                        textAlign: 'center'
+                    }}
+                >
+                    <div 
                         style={{
-                            padding: '10px 20px',
-                            backgroundColor: isCallButtonDisabled ? '#cccccc' : '#4CAF50',
-                            color: 'white',
-                            border: 'none',
-                            cursor: isCallButtonDisabled ? 'not-allowed' : 'pointer'
+                            position: 'absolute', 
+                            top: '10px', 
+                            left: '10px', 
+                            backgroundColor: 'rgba(0,0,0,0.5)', 
+                            color: 'white', 
+                            padding: '5px',
+                            borderRadius: '5px'
                         }}
                     >
-                        Start Call
-                    </button>
+                        Remote Stream
+                    </div>
+                    <video
+                        ref={(video) => {
+                            if (video) video.srcObject = remoteStream;
+                        }}
+                        autoPlay
+                        playsInline
+                        style={{
+                            width: '100%',
+                            maxHeight: '300px',
+                            objectFit: 'cover'
+                        }}
+                    />
+                    {!remoteStream && (
+                        <div style={{
+                            position: 'absolute',
+                            top: '50%',
+                            left: '50%',
+                            transform: 'translate(-50%, -50%)',
+                            color: 'red'
+                        }}>
+                            Waiting for Remote Stream
+                        </div>
+                    )}
                 </div>
             </div>
-        );
+    
+            <div className="controls">
+                <input 
+                    type="text" 
+                    placeholder="Enter target Client ID"
+                    value={targetClientId || ''}
+                    onChange={(e) => setTargetClientId(e.target.value)}
+                    style={{
+                        padding: '10px',
+                        width: '200px',
+                        marginRight: '10px'
+                    }}
+                />
+                <button 
+                    onClick={initiateCall}
+                    disabled={isCallButtonDisabled}
+                    style={{
+                        padding: '10px 20px',
+                        backgroundColor: isCallButtonDisabled ? '#cccccc' : '#4CAF50',
+                        color: 'white',
+                        border: 'none',
+                        cursor: isCallButtonDisabled ? 'not-allowed' : 'pointer'
+                    }}
+                >
+                    Start Call
+                </button>
+            </div>
+        </div>
+    );
 };
 
 export default VoIPApp;
