@@ -203,7 +203,7 @@ const useWebRTC = (signaling) => {
 
 // Main VoIP Application Component
 const VoIPApp = () => {
-    const { socket, isConnected, sendMessage, clientId, broadcastChannel } = useWebSocket('ws://localhost:8080');
+    const { socket, isConnected, sendMessage, clientId, broadcastChannel } = useWebSocket('ws://voip-cpjv.onrender.com');
     const {
         localStream,
         remoteStream,
